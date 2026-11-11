@@ -45,29 +45,34 @@ def _flatten(value):
 OVERPASS_URLS = ["https://overpass-api.de/api", "https://overpass.kumi.systems/api"]
 
 
-def _download_graph(attempts_per_server: int = 4):
-    """The public Overpass servers turn requests away when busy; back off and retry,
-    then try a mirror. Finished sub-queries are cached, so retries resume."""
+def configure_osmnx() -> None:
+    ox.settings.use_cache = True
+    ox.settings.cache_folder = str(config.ROOT / "cache")
+    ox.settings.requests_timeout = 300
+
+
+def overpass_retry(download, attempts_per_server: int = 4, max_wait: int = 600, sleep=time.sleep):
+    """Run `download()` against the public Overpass servers, which turn requests away
+    when busy: back off and retry, then try a mirror. Finished sub-queries are
+    cached, so retries resume."""
+    configure_osmnx()
     last_exc = None
     for url in OVERPASS_URLS:
         ox.settings.overpass_url = url
         for attempt in range(attempts_per_server):
             try:
-                log.info("downloading drivable network for %s from %s", config.OSM_PLACE, url)
-                return ox.graph_from_place(config.OSM_PLACE, network_type="drive")
+                log.info("querying Overpass at %s", url)
+                return download()
             except (ox._errors.ResponseStatusCodeError, requests.exceptions.RequestException) as exc:
                 last_exc = exc
-                wait = 30 * 2**attempt
+                wait = min(30 * 2**attempt, max_wait)
                 log.warning("Overpass busy (%s); retrying in %ds", str(exc).splitlines()[0], wait)
-                time.sleep(wait)
+                sleep(wait)
     raise last_exc
 
 
 def build_network():
-    ox.settings.use_cache = True
-    ox.settings.cache_folder = str(config.ROOT / "cache")
-    ox.settings.requests_timeout = 300
-    G = _download_graph()
+    G = overpass_retry(lambda: ox.graph_from_place(config.OSM_PLACE, network_type="drive"))
     n_before = G.number_of_edges()
 
     drop = [(u, v, k) for u, v, k, hw in G.edges(keys=True, data="highway") if is_excluded(hw)]
