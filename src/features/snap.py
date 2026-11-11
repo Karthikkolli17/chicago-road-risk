@@ -214,11 +214,17 @@ def load_inputs(con) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
         geometry=gpd.points_from_xy(c["longitude"], c["latitude"]), crs="EPSG:4326",
     ).to_crs(config.CRS)
     segs = gpd.read_parquet(SEGMENTS_PATH, columns=["segment_id", "highway", "name", "geometry"])
-    keep = ~segs["highway"].fillna("").str.split(";").map(
-        lambda tags: bool(tags) and all(t in SNAP_EXCLUDED_HIGHWAYS for t in tags))
+    keep = in_network(segs["highway"])
     log.info("snapping to %d of %d segments (dropped %s)", keep.sum(), len(segs),
              segs.loc[~keep, "highway"].value_counts().to_dict())
     return crashes, segs[keep]
+
+
+def in_network(highway: pd.Series) -> pd.Series:
+    """Segments crashes can be matched to and that the model scores: everything
+    except roads that are only busway / emergency bay / closed."""
+    return ~highway.fillna("").str.split(";").map(
+        lambda tags: bool(tags) and all(t in SNAP_EXCLUDED_HIGHWAYS for t in tags))
 
 
 def summarise(con) -> dict[str, pd.DataFrame]:
