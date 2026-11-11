@@ -4,6 +4,10 @@ A model segment is a group of network segments. Segments shorter than MIN_LENGTH
 merged into a touching segment (same street name first, then same road class, then the
 longest), so a 5 m stub between two close intersections does not stand alone.
 
+Crash counts are mid-block only: intersection crashes belong to model_junctions, and the
+exposure is midblock_m, the length outside the intersection discs. Run src.features.junctions
+first.
+
 Features describe the road only. Nothing is taken from a segment's own crashes; the one
 crash-derived input (posted speed) is pooled over the whole street, so a segment with no
 crashes still gets its street's speed.
@@ -156,19 +160,23 @@ def _community_area(geoms: gpd.GeoSeries, areas: gpd.GeoDataFrame) -> np.ndarray
     return out
 
 
-def build(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
+def segment_attributes(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
+    """Every network segment with its own road attributes (before merging)."""
     segs = load_segments()
-    nodes = pd.read_parquet(NODES_PATH, columns=["osmid", "highway", "street_count"]).set_index("osmid")
-    pois = gpd.read_parquet(POIS_PATH)
-    areas = gpd.read_parquet(COMMUNITY_AREAS_PATH)
-
-    # per-segment attributes
     segs["lanes_osm"] = segs["lanes"].map(max_number)
     segs = segs.join(segment_speed(segs, segment_name_keys(segs["name"]), street_speeds(con)))
     segs["oneway"] = segs["oneway"].astype(bool)
     segs["is_bridge"] = segs["bridge"].notna()
     segs["is_tunnel"] = segs["tunnel"].map(lambda t: has_tag(t, {"yes"}))
     segs["is_roundabout"] = segs["junction"].map(lambda t: has_tag(t, {"roundabout", "circular"}))
+    return segs
+
+
+def build(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
+    segs = segment_attributes(con)
+    nodes = pd.read_parquet(NODES_PATH, columns=["osmid", "highway", "street_count"]).set_index("osmid")
+    pois = gpd.read_parquet(POIS_PATH)
+    areas = gpd.read_parquet(COMMUNITY_AREAS_PATH)
     segs["group_id"] = merge_short(segs).to_numpy()
 
     # group geometry and length; road attributes come from the group's longest member
@@ -213,20 +221,35 @@ def build(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
     return g.reset_index()
 
 
-def write_tables(con: duckdb.DuckDBPyConnection, g: gpd.GeoDataFrame) -> None:
-    """model_segments = features + summed counts; geometry goes to a GeoParquet for the map."""
+def write_tables(con: duckdb.DuckDBPyConnection, g: gpd.GeoDataFrame, years=YEARS) -> None:
+    """model_segments = features + mid-block exposure + mid-block crash counts.
+
+    Needs crash_locations and segment_midblock (src.features.junctions). Intersection crashes
+    are counted on model_junctions instead. Geometry goes to a GeoParquet for the map.
+    """
     groups = pd.read_parquet(OSM_DIR / "segment_groups.parquet")
     feats = pd.DataFrame(g.drop(columns="geometry"))
     con.register("_groups", groups)
     con.register("_feats", feats)
-    sums = ", ".join(f"sum(c.{c})::INT AS {c}" for c in COUNTS)
     con.execute("CREATE OR REPLACE TABLE segment_groups AS SELECT * FROM _groups")
     con.execute(f"""
         CREATE OR REPLACE TABLE model_segments AS
-        SELECT f.*, {sums}
-        FROM _feats f
-        JOIN segment_groups s USING (model_segment_id)
-        JOIN segment_counts c USING (segment_id)
+        WITH c AS (
+            SELECT g.model_segment_id, c.*
+            FROM crash_locations l JOIN crashes c USING (crash_record_id)
+            JOIN segment_groups g USING (segment_id)
+            WHERE l.junction_id IS NULL AND c.crash_year BETWEEN {years[0]} AND {years[1]}),
+        e AS (
+            SELECT g.model_segment_id, sum(m.midblock_m) AS midblock_m
+            FROM segment_groups g JOIN segment_midblock m USING (segment_id) GROUP BY 1)
+        SELECT f.*, e.midblock_m,
+               count(c.crash_record_id) AS crashes, count(*) FILTER (c.is_ksi) AS ksi,
+               count(*) FILTER (c.most_severe_injury = 'FATAL') AS fatal,
+               count(*) FILTER (c.has_pedestrian) AS ped_crashes,
+               count(*) FILTER (c.has_cyclist) AS bike_crashes,
+               count(*) FILTER (c.has_pedestrian OR c.has_cyclist) AS vru_crashes,
+               count(*) FILTER (c.is_ksi AND (c.has_pedestrian OR c.has_cyclist)) AS ksi_vru
+        FROM _feats f JOIN e USING (model_segment_id) LEFT JOIN c USING (model_segment_id)
         GROUP BY ALL ORDER BY model_segment_id
     """)
     con.unregister("_groups")
@@ -241,10 +264,13 @@ def checks(con: duckdb.DuckDBPyConnection) -> list[str]:
     n_net, n_grouped = q("SELECT (SELECT count(*) FROM segment_counts), (SELECT count(*) FROM segment_groups)")
     if n_net != n_grouped:
         fails.append(f"segment_groups has {n_grouped} rows, network has {n_net}")
-    for c in COUNTS:
-        a, b = q(f"SELECT (SELECT sum({c}) FROM segment_counts), (SELECT sum({c}) FROM model_segments)")
-        if a != b:
-            fails.append(f"{c}: {a} on segments vs {b} on model segments")
+    for c in COUNTS:  # every matched crash is either mid-block or at an intersection
+        a, b, j = q(f"SELECT (SELECT sum({c}) FROM segment_counts), (SELECT sum({c}) FROM model_segments), "
+                    f"(SELECT sum({c}) FROM model_junctions)")
+        if a != b + j:
+            fails.append(f"{c}: {a} on segments vs {b} mid-block + {j} at intersections")
+    if q("SELECT count(*) FROM model_segments WHERE midblock_m < 0 OR midblock_m > length_m * 1.01")[0]:
+        fails.append("mid-block length outside 0..length")
     a, b = q("SELECT (SELECT sum(length_m) FROM segment_counts), (SELECT sum(length_m) FROM model_segments)")
     if abs(a - b) > 1e-6 * a:
         fails.append(f"length: {a:.0f} vs {b:.0f}")
@@ -266,12 +292,13 @@ def summarise(con: duckdb.DuckDBPyConnection) -> dict[str, pd.DataFrame]:
                                 count(*) FILTER (length_m < {MIN_LENGTH_M}) AS still_under_{MIN_LENGTH_M}m
                          FROM model_segments"""),
         "by_class": q("""SELECT road_class, count(*) segments, round(sum(length_m)/1000) km,
-                                sum(ksi) ksi, round(1000 * sum(ksi) / sum(length_m), 2) ksi_per_km
+                                round(sum(midblock_m)/1000) midblock_km, sum(ksi) midblock_ksi,
+                                round(1000 * sum(ksi) / sum(midblock_m), 2) ksi_per_midblock_km
                          FROM model_segments GROUP BY 1 ORDER BY min(-road_class_rank)"""),
         "sources": q("""SELECT speed_source, count(*) segments, round(avg(speed_mph), 1) avg_mph
                         FROM model_segments GROUP BY 1 ORDER BY 2 DESC"""),
         "near_school": q("""SELECT near_school, count(*) segments, round(sum(length_m)/1000) km, sum(ksi) ksi,
-                                   sum(ksi_vru) ksi_vru, round(1000 * sum(ksi) / sum(length_m), 2) ksi_per_km
+                                   sum(ksi_vru) ksi_vru, round(1000 * sum(ksi) / sum(midblock_m), 2) ksi_per_km
                             FROM model_segments GROUP BY 1 ORDER BY 1"""),
         "features": q("SELECT " + ", ".join(
             f"round(avg({f}::DOUBLE), 2) AS {f}" for f in FEATURES) + " FROM model_segments").T
@@ -282,7 +309,7 @@ def summarise(con: duckdb.DuckDBPyConnection) -> dict[str, pd.DataFrame]:
 def write_report(results: dict[str, pd.DataFrame], fails: list[str], path) -> None:
     text = [f"# Model segments and features ({YEARS[0]}–{YEARS[1]} counts)\n",
             "## Checks\n\n" + ("All passed." if not fails else "\n".join(f"- FAIL {f}" for f in fails))]
-    titles = {"merging": f"Merging segments under {MIN_LENGTH_M} m", "by_class": "Serious crashes by road class",
+    titles = {"merging": f"Merging segments under {MIN_LENGTH_M} m", "by_class": "Mid-block serious crashes by road class",
               "sources": "Where the speed limit came from", "near_school": f"Within {NEAR_SCHOOL_M} m of a school",
               "features": "Feature means"}
     for k, t in titles.items():
