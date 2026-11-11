@@ -25,11 +25,22 @@ def _as_list(value) -> list:
     return [value]
 
 
-def is_excluded(highway) -> bool:
+def is_excluded(highway, name=None) -> bool:
     """True if every highway tag on the edge is a motorway type. Edges OSM merged
-    from e.g. ['motorway_link', 'primary'] are kept, since CPD covers part of them."""
+    from e.g. ['motorway_link', 'primary'] are kept, since CPD covers part of them.
+    Lake Shore Drive is tagged motorway in OSM but is a city road that CPD patrols
+    (thousands of crashes in the data), so it is kept."""
     tags = _as_list(highway)
+    if any(keep in n for n in _as_list(name) for keep in config.KEEP_MOTORWAY_NAMES):
+        return False
     return bool(tags) and all(t in config.EXCLUDED_HIGHWAYS for t in tags)
+
+
+def network_polygon(buffer_m: float = config.NETWORK_BUFFER_M):
+    """City boundary grown by `buffer_m`, so border streets whose centre line runs
+    just outside the city (Harlem, Austin, Howard...) are in the network."""
+    city = ox.geocode_to_gdf(config.OSM_PLACE).to_crs(config.CRS)
+    return city.buffer(buffer_m * config.FT_PER_M).to_crs("EPSG:4326").iloc[0]
 
 
 def _flatten(value):
@@ -72,10 +83,14 @@ def overpass_retry(download, attempts_per_server: int = 4, max_wait: int = 600, 
 
 
 def build_network():
-    G = overpass_retry(lambda: ox.graph_from_place(config.OSM_PLACE, network_type="drive"))
+    configure_osmnx()
+    polygon = network_polygon()
+    G = overpass_retry(lambda: ox.graph_from_polygon(polygon, network_type="drive"),
+                       attempts_per_server=15)
     n_before = G.number_of_edges()
 
-    drop = [(u, v, k) for u, v, k, hw in G.edges(keys=True, data="highway") if is_excluded(hw)]
+    drop = [(u, v, k) for u, v, k, d in G.edges(keys=True, data=True)
+            if is_excluded(d.get("highway"), d.get("name"))]
     G.remove_edges_from(drop)
     G.remove_nodes_from([n for n, d in G.degree() if d == 0])
     log.info("removed %d motorway edges of %d", len(drop), n_before)
@@ -86,6 +101,9 @@ def build_network():
     nodes, edges = ox.graph_to_gdfs(G)
 
     edges = edges.reset_index()
+    # osmnx's 'length' is metres, but on a GeoDataFrame `.length` means the geometry
+    # length in CRS feet; a distinct name keeps the two from being mixed up.
+    edges = edges.rename(columns={"length": "length_m"})
     edges.insert(0, "segment_id", edges["u"].astype(str) + "-" + edges["v"].astype(str) + "-" + edges["key"].astype(str))
     for col in edges.columns:
         if edges[col].dtype == object and col != "geometry":

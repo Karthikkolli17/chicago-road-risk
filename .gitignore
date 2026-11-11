@@ -5,3 +5,6 @@ __pycache__/
 data/
 cache/
 .DS_Store
+reports/
+scripts/
+tests/

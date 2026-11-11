@@ -28,6 +28,9 @@ CRASH_COLUMNS = [
     "injuries_incapacitating",
     "latitude",
     "longitude",
+    # location only: used to pick the right road at intersections, never as a model feature
+    "street_direction",
+    "street_name",
 ]
 PEOPLE_COLUMNS = [
     "person_id",
@@ -44,6 +47,8 @@ CITY_BBOX = {"lat_min": 41.64, "lat_max": 42.03, "lon_min": -87.95, "lon_max": -
 
 OSM_PLACE = "Chicago, Illinois, USA"
 EXCLUDED_HIGHWAYS = {"motorway", "motorway_link"}  # CPD does not cover these
+KEEP_MOTORWAY_NAMES = ("Lake Shore",)  # tagged motorway in OSM, but a city road CPD patrols
+NETWORK_BUFFER_M = 100  # grow the city boundary so border streets are in the network
 CRS = "EPSG:3435"  # NAD83 / Illinois East — NOTE: units are US survey FEET
 FT_PER_M = 1 / 0.3048006096
 SNAP_MAX_FT = 30 * FT_PER_M  # the 30 m snapping cap, in CRS units

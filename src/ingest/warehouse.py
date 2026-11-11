@@ -17,12 +17,7 @@ def _sql_list(values) -> str:
 
 
 def _latest_version(con: duckdb.DuckDBPyConnection, folder: Path, key: str) -> str:
-    """SQL selecting one row per `key` from the month files in `folder`.
-
-    If the city edits a crash's date after we pulled it, the crash can sit in two
-    month files: a stale copy in the old month and a fresh one in the new month.
-    The copy from the most recently written file is the current one, so it wins.
-    """
+    
     files = sorted(folder.glob("month=*/*.parquet"))
     if not files:
         raise FileNotFoundError(f"no parquet files under {folder}")
