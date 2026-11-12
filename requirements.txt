@@ -10,3 +10,7 @@ osmnx>=2.0
 pytest>=8
 tabulate>=0.9
 matplotlib>=3.8
+statsmodels>=0.14
+scikit-learn>=1.5
+lightgbm>=4.7
+shap>=0.46

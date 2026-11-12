@@ -1,16 +1,3 @@
-"""Intersections as their own modelling unit, and where every matched crash belongs.
-
-Chicago records an intersection crash at a point 10–20 m from the junction; beyond 20 m the
-distance profile is flat (mid-block crashes). So a crash is an intersection crash when its
-nearest junction node is within JUNCTION_RADIUS_M and the road it was matched to meets that
-intersection. Everything else is a mid-block crash on its road segment.
-
-An intersection is a cluster of OSM junction nodes (network degree >= 3) lying within
-CLUSTER_M of each other: divided roads draw one real intersection as several nodes.
-
-Mid-block exposure is the segment length outside the intersection discs, so a road is not
-credited with length that belongs to its intersections.
-"""
 from __future__ import annotations
 
 import logging
@@ -40,16 +27,16 @@ FEATURES = ["n_nodes", "n_approaches", "n_streets", "max_class_rank", "min_class
             "dist_school_m", "near_school", "dist_hospital_m"]
 
 
-# --------------------------------------------------------------------------- intersections
+# intersections
 def junction_nodes(segs: pd.DataFrame, nodes: pd.DataFrame) -> pd.DataFrame:
-    """Nodes where three or more network segments meet (counted in our network, not OSM's)."""
+
     deg = pd.concat([segs["u"], segs["v"]]).value_counts()
     ids = deg.index[deg >= 3]
     return nodes.loc[ids, ["x", "y", "highway"]].rename_axis("osmid").reset_index()
 
 
 def cluster(x: np.ndarray, y: np.ndarray, ids: np.ndarray, tol: float) -> np.ndarray:
-    """Single-linkage clusters of points closer than tol. Returns a junction id per point."""
+
     pts = shapely.points(x, y)
     a, b = shapely.STRtree(pts).query(pts, predicate="dwithin", distance=tol)
     parent = np.arange(len(pts))
@@ -69,27 +56,28 @@ def cluster(x: np.ndarray, y: np.ndarray, ids: np.ndarray, tol: float) -> np.nda
     return np.array([f"J{i}" for i in first], dtype=object)
 
 
-def locate_crashes(crash_xy: pd.DataFrame, jn: pd.DataFrame, seg_ends: pd.DataFrame,
-                   radius: float) -> pd.Series:
-    """junction_id for intersection crashes, None for mid-block ones.
-
-    crash_xy: segment_id, x, y.  jn: osmid, x, y, junction_id.  seg_ends: segment_id, u, v.
-    """
-    tree = shapely.STRtree(shapely.points(jn["x"], jn["y"]))
-    idx, _ = tree.query_nearest(shapely.points(crash_xy["x"], crash_xy["y"]), max_distance=radius,
-                                return_distance=True, all_matches=False)
-    near = pd.Series(None, index=crash_xy.index, dtype=object)
-    near.iloc[idx[0]] = jn["junction_id"].to_numpy()[idx[1]]
+def locate_crashes(crash_xy: pd.DataFrame, jn: pd.DataFrame, seg_ends: pd.DataFrame, radius: float) -> pd.Series:
+    
     of_node = dict(zip(jn["osmid"], jn["junction_id"]))
     ends = seg_ends.set_index("segment_id").reindex(crash_xy["segment_id"])
     ju = ends["u"].map(of_node).to_numpy()
     jv = ends["v"].map(of_node).to_numpy()
-    touches = (near.to_numpy() == ju) | (near.to_numpy() == jv)
-    return near.where(touches & near.notna().to_numpy(), None)
+
+    pts = shapely.points(crash_xy["x"], crash_xy["y"])
+    nodes = shapely.points(jn["x"], jn["y"])
+    ci, ni = shapely.STRtree(nodes).query(pts, predicate="dwithin", distance=radius)
+    pair_j = jn["junction_id"].to_numpy()[ni]
+    own = (pair_j == ju[ci]) | (pair_j == jv[ci])
+    pairs = pd.DataFrame({"crash": ci[own], "junction_id": pair_j[own],
+                          "dist": shapely.distance(pts[ci[own]], nodes[ni[own]])})
+    best = pairs.sort_values(["crash", "dist", "junction_id"]).drop_duplicates("crash")
+    out = np.full(len(crash_xy), None, dtype=object)
+    out[best["crash"].to_numpy()] = best["junction_id"].to_numpy()
+    return pd.Series(out, index=crash_xy.index, dtype=object)
 
 
 def midblock_length_m(segs: gpd.GeoDataFrame, jn: pd.DataFrame, radius: float) -> np.ndarray:
-    """Segment length outside the discs around every node of the intersections it meets."""
+
     of_node = dict(zip(jn["osmid"], jn["junction_id"]))
     pts_of = jn.groupby("junction_id").apply(lambda d: list(zip(d["x"], d["y"])))
     discs = []
@@ -105,9 +93,15 @@ def midblock_length_m(segs: gpd.GeoDataFrame, jn: pd.DataFrame, radius: float) -
     return out / config.FT_PER_M
 
 
-# --------------------------------------------------------------------------- features
+# features
+def count_streets(keys) -> int:
+
+    keys = list(keys)
+    return len({ks[0] for ks in keys if ks}) + int(any(not ks for ks in keys))
+
+
 def junction_features(segs: pd.DataFrame, jn: pd.DataFrame) -> pd.DataFrame:
-    """Describe each intersection by the roads that approach it (not its internal links)."""
+
     of_node = dict(zip(jn["osmid"], jn["junction_id"]))
     s = segs.assign(ju=segs["u"].map(of_node), jv=segs["v"].map(of_node))
     s["lanes_f"] = s["lanes_osm"].fillna(s.groupby("road_class")["lanes_osm"].transform("median")).fillna(2)
@@ -117,7 +111,7 @@ def junction_features(segs: pd.DataFrame, jn: pd.DataFrame) -> pd.DataFrame:
                      s[~internal & s["jv"].notna()].assign(junction_id=lambda d: d["jv"])])
     a = app.groupby("junction_id").agg(
         n_approaches=("segment_id", "size"),
-        n_streets=("keys", lambda k: len({x for ks in k for x in ks[:1]}) + sum(len(ks) == 0 for ks in k)),
+        n_streets=("keys", count_streets),
         max_class_rank=("road_class_rank", "max"),
         min_class_rank=("road_class_rank", "min"),
         n_main_approaches=("road_class_rank", lambda r: int((r >= MAIN_RANK).sum())),
