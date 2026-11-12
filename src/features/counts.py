@@ -1,9 +1,3 @@
-"""Crash counts per road segment: the model's target.
-
-One row for every segment in the network, including segments with no crashes
-(the Poisson model needs the zeros). Keyed by segment_id so that merged segments
-can later be built by summing rows.
-"""
 from __future__ import annotations
 
 import logging
@@ -22,7 +16,7 @@ YEARS = (2021, 2025)  # five full years; 2026 is left for the pipeline to add
 
 
 def build_counts(con: duckdb.DuckDBPyConnection, network: pd.DataFrame, years=YEARS) -> pd.DataFrame:
-    """network: segment_id, length_m for every modelled segment."""
+
     con.register("_network", network[["segment_id", "length_m"]])
     con.execute(f"""
         CREATE OR REPLACE TABLE segment_counts AS
@@ -49,7 +43,7 @@ def build_counts(con: duckdb.DuckDBPyConnection, network: pd.DataFrame, years=YE
 
 
 def reconcile(con: duckdb.DuckDBPyConnection, years=YEARS) -> pd.DataFrame:
-    """Totals in segment_counts vs the matched crashes they were built from."""
+
     return con.execute(f"""
         WITH src AS (
             SELECT count(*) crashes, count(*) FILTER (c.is_ksi) ksi,

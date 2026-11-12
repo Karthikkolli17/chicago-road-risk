@@ -1,12 +1,3 @@
-"""Match each crash to one road segment.
-
-Rule: among segments within 30 m, take the nearest one whose name matches the
-street the police recorded. If none matches, take the nearest segment only when it
-has no name (often a ramp); if it is named, it is a different street, so the crash
-stays unmatched. Crashes with no segment within 30 m are unmatched too. Both kinds
-of unmatched crash are counted in the report.
-The street name is only used here, never as a model feature.
-"""
 from __future__ import annotations
 
 import logging
@@ -95,8 +86,7 @@ _QUALIFIERS = (
 
 
 def _same_street(a: str, b: str) -> bool:
-    """Equal, or one is the other plus qualifier words only: 'WACKER' ~ 'LOWER WACKER'
-    and 'LAKE SHORE' ~ 'DUSABLE LAKE SHORE', but 'WELLS' !~ 'IDA B WELLS'."""
+
     if a == b:
         return True
     short, long_ = sorted((a, b), key=len)
@@ -109,8 +99,7 @@ def _same_street(a: str, b: str) -> bool:
 
 
 def police_key(name, direction=None) -> str | None:
-    """Key for the street police recorded; the address direction is needed only to
-    tell East Lake Shore Drive apart from the Drive."""
+
     raw = None if name is None or (isinstance(name, float) and np.isnan(name)) else str(name).upper().strip()
     d = None if direction is None or (isinstance(direction, float) and np.isnan(direction)) else str(direction).upper()
     if (d, raw) in _POLICE_ALIASES:
@@ -119,7 +108,7 @@ def police_key(name, direction=None) -> str | None:
 
 
 def is_lane(name) -> bool:
-    """'LAKE SHORE DR SB' or 'LAKE SHORE DR E': police name one roadway of a divided road."""
+
     tokens = str(name or "").upper().split()
     if len(tokens) < 2:
         return False
@@ -133,7 +122,7 @@ def names_match(crash_key: str | None, segment_keys: tuple[str, ...]) -> bool:
 
 
 def segment_name_keys(names: pd.Series) -> list[tuple[str, ...]]:
-    """OSM names can hold several values joined by ';' (merged ways)."""
+
     out = []
     for n in names:
         if n is None or (isinstance(n, float) and np.isnan(n)):
@@ -145,8 +134,7 @@ def segment_name_keys(names: pd.Series) -> list[tuple[str, ...]]:
 
 def snap(crashes: gpd.GeoDataFrame, segments: gpd.GeoDataFrame,
          max_dist_ft: float = config.SNAP_MAX_FT) -> pd.DataFrame:
-    """crashes: crash_record_id, street_name, point geometry. segments: segment_id,
-    name, line geometry. Both in the project CRS (feet). One row per crash out."""
+
     crashes = crashes.reset_index(drop=True)
     segments = segments.reset_index(drop=True)
     ci, si = segments.sindex.query(crashes.geometry, predicate="dwithin", distance=max_dist_ft)
@@ -221,8 +209,7 @@ def load_inputs(con) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
 
 
 def in_network(highway: pd.Series) -> pd.Series:
-    """Segments crashes can be matched to and that the model scores: everything
-    except roads that are only busway / emergency bay / closed."""
+
     return ~highway.fillna("").str.split(";").map(
         lambda tags: bool(tags) and all(t in SNAP_EXCLUDED_HIGHWAYS for t in tags))
 

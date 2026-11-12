@@ -26,10 +26,7 @@ def _as_list(value) -> list:
 
 
 def is_excluded(highway, name=None) -> bool:
-    """True if every highway tag on the edge is a motorway type. Edges OSM merged
-    from e.g. ['motorway_link', 'primary'] are kept, since CPD covers part of them.
-    Lake Shore Drive is tagged motorway in OSM but is a city road that CPD patrols
-    (thousands of crashes in the data), so it is kept."""
+
     tags = _as_list(highway)
     if any(keep in n for n in _as_list(name) for keep in config.KEEP_MOTORWAY_NAMES):
         return False
@@ -37,15 +34,13 @@ def is_excluded(highway, name=None) -> bool:
 
 
 def network_polygon(buffer_m: float = config.NETWORK_BUFFER_M):
-    """City boundary grown by `buffer_m`, so border streets whose centre line runs
-    just outside the city (Harlem, Austin, Howard...) are in the network."""
+
     city = ox.geocode_to_gdf(config.OSM_PLACE).to_crs(config.CRS)
     return city.buffer(buffer_m * config.FT_PER_M).to_crs("EPSG:4326").iloc[0]
 
 
 def _flatten(value):
-    """Parquet needs one type per column, but OSM tags mix scalars and lists
-    (e.g. osmid 123 vs [123, 456]), so every value becomes text and lists become 'a;b'."""
+
     if isinstance(value, list):
         return ";".join(str(v) for v in value)
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -63,9 +58,7 @@ def configure_osmnx() -> None:
 
 
 def overpass_retry(download, attempts_per_server: int = 4, max_wait: int = 600, sleep=time.sleep):
-    """Run `download()` against the public Overpass servers, which turn requests away
-    when busy: back off and retry, then try a mirror. Finished sub-queries are
-    cached, so retries resume."""
+
     configure_osmnx()
     last_exc = None
     for url in OVERPASS_URLS:

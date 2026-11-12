@@ -97,9 +97,7 @@ def reconcile(client: SodaClient, start: str = config.START_DATE) -> pd.DataFram
 
 def run(start: str = config.START_DATE, end: date | None = None, force: bool = False,
         heal: bool = True) -> list[str]:
-    """Pull months that are missing, recent, or (with `heal`) whose crash count no
-    longer matches the server, e.g. because the city deleted or re-dated a crash.
-    Returns the months that failed."""
+
     end = end or date.today()
     client = SodaClient(config.SODA_DOMAIN, config.SODA_APP_TOKEN)
     months = month_starts(start, end)

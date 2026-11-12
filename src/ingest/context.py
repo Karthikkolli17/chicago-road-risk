@@ -1,4 +1,3 @@
-"""Context layers for segment features: schools, hospitals (OSM) and community areas (city portal)."""
 from __future__ import annotations
 
 import logging
@@ -35,11 +34,7 @@ def classify_poi(row: pd.Series) -> str | None:
 
 
 def tidy_pois(raw: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """One row per school/hospital: kind, name, geometry in the project CRS.
 
-    Schools are often mapped both as a campus outline and as a point inside it,
-    so points lying inside a same-kind polygon are dropped.
-    """
     df = raw.reset_index()
     df["kind"] = df.apply(classify_poi, axis=1)
     df = df[df["kind"].notna() & df.geometry.notna()]
@@ -64,8 +59,7 @@ POI_BUFFER_FT = 1000 * config.FT_PER_M
 
 
 def read_pois_from_pbf(path) -> gpd.GeoDataFrame:
-    """Schools/hospitals from a Geofabrik extract: nodes as points, closed ways and
-    multipolygon relations as polygons. Same shape as osmnx's features output."""
+
     import osmium
     from shapely import wkb
 
@@ -103,8 +97,7 @@ def clip_to_city(pois: gpd.GeoDataFrame, areas: gpd.GeoDataFrame, buffer_ft: flo
 
 
 def fetch_pois(source: str = "pbf") -> gpd.GeoDataFrame:
-    """source='pbf' reads the Geofabrik Illinois extract (download it first, see
-    PBF_URL); source='overpass' queries the public Overpass API, which is often full."""
+
     if source == "pbf":
         if not PBF_PATH.exists():
             raise FileNotFoundError(f"download {PBF_URL} to {PBF_PATH} first")

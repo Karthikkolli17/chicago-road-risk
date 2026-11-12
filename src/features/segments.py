@@ -1,17 +1,3 @@
-"""Model segments: short pieces merged into neighbours, with road features and crash counts.
-
-A model segment is a group of network segments. Segments shorter than MIN_LENGTH_M are
-merged into a touching segment (same street name first, then same road class, then the
-longest), so a 5 m stub between two close intersections does not stand alone.
-
-Crash counts are mid-block only: intersection crashes belong to model_junctions, and the
-exposure is midblock_m, the length outside the intersection discs. Run src.features.junctions
-first.
-
-Features describe the road only. Nothing is taken from a segment's own crashes; the one
-crash-derived input (posted speed) is pooled over the whole street, so a segment with no
-crashes still gets its street's speed.
-"""
 from __future__ import annotations
 
 import logging
@@ -48,9 +34,9 @@ FEATURES = ["length_m", "road_class_rank", "is_link", "lanes", "lanes_imputed", 
 COUNTS = ["crashes", "ksi", "fatal", "ped_crashes", "bike_crashes", "vru_crashes", "ksi_vru"]
 
 
-# --------------------------------------------------------------------------- road attributes
+# road attributes
 def road_class(highway) -> tuple[str, bool]:
-    """'secondary_link' -> ('secondary', True); 'tertiary;residential' -> ('tertiary', False)."""
+
     best, link = "residential", False
     for tag in str(highway or "").split(";"):
         is_link = tag.endswith("_link")
@@ -61,7 +47,7 @@ def road_class(highway) -> tuple[str, bool]:
 
 
 def max_number(value) -> float:
-    """Largest number in an OSM value: '3;2' -> 3, '30 mph;35 mph' -> 35, None -> nan."""
+
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return np.nan
     nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", str(value))]
@@ -73,13 +59,9 @@ def has_tag(value, tags: set[str]) -> bool:
         any(t in tags for t in str(value).split(";"))
 
 
-# --------------------------------------------------------------------------- merging
+# merging
 def merge_short(segs: pd.DataFrame, min_length_m: float = MIN_LENGTH_M) -> pd.Series:
-    """segment_id -> group_id. Needs segment_id, u, v, length_m, name, road_class.
 
-    Each short segment joins one touching segment. Groups therefore hold at most one
-    segment of normal length, and the group id is its longest member.
-    """
     segs = segs.reset_index(drop=True)
     at_node: dict[int, list[int]] = {}
     for i, (u, v) in enumerate(zip(segs["u"], segs["v"])):
@@ -111,7 +93,7 @@ def merge_short(segs: pd.DataFrame, min_length_m: float = MIN_LENGTH_M) -> pd.Se
     return pd.Series(root.map(anchor).to_numpy(), index=segs["segment_id"], name="group_id")
 
 
-# --------------------------------------------------------------------------- inputs
+# inputs
 def load_segments() -> gpd.GeoDataFrame:
     s = gpd.read_parquet(SEGMENTS_PATH)
     s = s[in_network(s["highway"])].reset_index(drop=True)
@@ -123,7 +105,7 @@ def load_segments() -> gpd.GeoDataFrame:
 
 
 def street_speeds(con: duckdb.DuckDBPyConnection) -> pd.Series:
-    """Median police-recorded posted speed per street key, pooled over the whole street."""
+
     c = con.execute("""
         SELECT street_name, street_direction, posted_speed_limit
         FROM crashes WHERE posted_speed_limit BETWEEN 10 AND 55
@@ -143,7 +125,7 @@ def segment_speed(segs: pd.DataFrame, keys: list[tuple[str, ...]], by_street: pd
     return pd.DataFrame({"speed_mph": speed.fillna(default), "speed_source": source}, index=segs.index)
 
 
-# --------------------------------------------------------------------------- build
+# build
 def _nearest_m(geoms: gpd.GeoSeries, pois: gpd.GeoDataFrame) -> np.ndarray:
     idx, dist = pois.sindex.nearest(geoms, return_distance=True, return_all=False)
     out = np.full(len(geoms), np.nan)
@@ -152,7 +134,7 @@ def _nearest_m(geoms: gpd.GeoSeries, pois: gpd.GeoDataFrame) -> np.ndarray:
 
 
 def _community_area(geoms: gpd.GeoSeries, areas: gpd.GeoDataFrame) -> np.ndarray:
-    """Area holding the segment's midpoint; nearest area if the midpoint is outside the city."""
+
     mid = gpd.GeoSeries(shapely.line_interpolate_point(geoms.values, 0.5, normalized=True), crs=geoms.crs)
     idx, _ = areas.sindex.nearest(mid, return_distance=True, return_all=False)
     out = np.empty(len(geoms), dtype=int)
@@ -161,7 +143,7 @@ def _community_area(geoms: gpd.GeoSeries, areas: gpd.GeoDataFrame) -> np.ndarray
 
 
 def segment_attributes(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
-    """Every network segment with its own road attributes (before merging)."""
+
     segs = load_segments()
     segs["lanes_osm"] = segs["lanes"].map(max_number)
     segs = segs.join(segment_speed(segs, segment_name_keys(segs["name"]), street_speeds(con)))
@@ -222,11 +204,7 @@ def build(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFrame:
 
 
 def write_tables(con: duckdb.DuckDBPyConnection, g: gpd.GeoDataFrame, years=YEARS) -> None:
-    """model_segments = features + mid-block exposure + mid-block crash counts.
 
-    Needs crash_locations and segment_midblock (src.features.junctions). Intersection crashes
-    are counted on model_junctions instead. Geometry goes to a GeoParquet for the map.
-    """
     groups = pd.read_parquet(OSM_DIR / "segment_groups.parquet")
     feats = pd.DataFrame(g.drop(columns="geometry"))
     con.register("_groups", groups)
@@ -257,7 +235,7 @@ def write_tables(con: duckdb.DuckDBPyConnection, g: gpd.GeoDataFrame, years=YEAR
     g[["model_segment_id", "name", "geometry"]].to_crs("EPSG:4326").to_parquet(MODEL_SEGMENTS_PATH)
 
 
-# --------------------------------------------------------------------------- checks & report
+# checks & report
 def checks(con: duckdb.DuckDBPyConnection) -> list[str]:
     fails = []
     q = lambda sql: con.execute(sql).fetchone()
