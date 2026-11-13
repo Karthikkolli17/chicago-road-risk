@@ -12,6 +12,7 @@ from sklearn.model_selection import GroupKFold
 
 from src import config
 from src.features import junctions as J
+from src.features import mapillary as MLY
 from src.features import segments as S
 from src.features.counts import YEARS
 
@@ -38,21 +39,23 @@ class Unit:
     exposure: str | None
     where: str
     num_leaves: int  # picked by a small grid on spatial-CV deviance (7/15/31 x 50/200/500)
+    extra_table: str | None = None  # more features, one row per unit, joined on the unit id
 
 
 SEGMENTS = Unit("segments", "model_segments", "model_segment_id", tuple(S.FEATURES),
                 ("road_class_rank",), ("length_m", "dist_school_m", "dist_hospital_m"),
                 "midblock_m", f"midblock_m >= {MIN_MIDBLOCK_M}", num_leaves=7)
-JUNCTIONS = Unit("junctions", "model_junctions", "junction_id", tuple(J.FEATURES),
+# street-photo features help intersections only (Day 4 test); road stretches keep OSM alone
+JUNCTIONS = Unit("junctions", "model_junctions", "junction_id", tuple(J.FEATURES + MLY.JUNCTION_FEATURES),
                  ("max_class_rank", "min_class_rank"), ("dist_school_m", "dist_hospital_m"),
-                 None, "true", num_leaves=15)
+                 None, "true", num_leaves=15, extra_table="mly_junctions")
 UNITS = (SEGMENTS, JUNCTIONS)
 
 
 # data
 def load(con: duckdb.DuckDBPyConnection, unit: Unit, years=YEARS) -> pd.DataFrame:
 
-    if unit is SEGMENTS:
+    if unit.table == SEGMENTS.table:
         ksi = f"""SELECT g.model_segment_id AS id, count(*) AS y
                   FROM crash_locations l JOIN crashes c USING (crash_record_id)
                   JOIN segment_groups g USING (segment_id)
@@ -64,11 +67,18 @@ def load(con: duckdb.DuckDBPyConnection, unit: Unit, years=YEARS) -> pd.DataFram
                   WHERE l.junction_id IS NOT NULL AND c.is_ksi AND c.crash_year BETWEEN {years[0]} AND {years[1]}
                   GROUP BY 1"""
     exposure = f"{unit.exposure} / 1000.0" if unit.exposure else "1.0"
+    extra = f"LEFT JOIN {unit.extra_table} x ON x.{unit.id} = t.{unit.id}" if unit.extra_table else ""
     df = con.execute(f"""
-        SELECT t.{unit.id} AS id, {", ".join("t." + f for f in unit.features)},
+        SELECT t.{unit.id} AS id, {", ".join(unit.features)},
                t.community_area, {exposure} AS exposure, coalesce(k.y, 0) AS y
-        FROM {unit.table} t LEFT JOIN ({ksi}) k ON k.id = t.{unit.id}
+        FROM {unit.table} t {extra} LEFT JOIN ({ksi}) k ON k.id = t.{unit.id}
         WHERE {unit.where} ORDER BY t.{unit.id}""").df()
+    if unit.extra_table:
+        missing = con.execute(f"""SELECT count(*) FROM {unit.table} t
+                                  ANTI JOIN {unit.extra_table} x ON x.{unit.id} = t.{unit.id}""").fetchone()[0]
+        if missing:  # a stale extra table must stop the run, not drop places from the map
+            raise RuntimeError(f"{unit.extra_table} has no row for {missing} of the units in {unit.table}; "
+                               "rebuild it")
     bools = [f for f in unit.features if df[f].dtype == bool]
     df[bools] = df[bools].astype(int)
     return df

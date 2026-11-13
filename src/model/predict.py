@@ -54,7 +54,23 @@ LABELS = {
     "is_tunnel": ("tunnel", _flag("tunnel / underpass")),
     "is_roundabout": ("roundabout", _flag("roundabout")),
     "has_link": ("ramp", _flag("ramp joins here")),
+    # street photos: signal and stop text comes from has_signal / has_stop, which show both sources
+    "mly_signal": ("signals", lambda v: None),
+    "mly_stop": ("stop signs", lambda v: None),
+    "n_crosswalks": ("crosswalks", lambda v: f"busy crossing ({v:g} marked crosswalks)" if v >= 1 else None),
+    "mly_covered": ("photo coverage", lambda v: None),
 }
+# a feature seen in either source: the reason text uses the combined value
+_EITHER = {"has_signal": "mly_signal", "has_stop": "mly_stop"}
+
+
+def readable(X: pd.DataFrame) -> pd.DataFrame:
+
+    X = X.copy()
+    for osm, mly in _EITHER.items():
+        if osm in X and mly in X:
+            X[osm] = X[[osm, mly]].max(axis=1)
+    return X
 
 
 def drivers(X: pd.DataFrame, sv: np.ndarray, n: int = N_DRIVERS, min_shap: float = MIN_SHAP) -> list[list[str]]:
@@ -86,7 +102,7 @@ def predict_unit(con: duckdb.DuckDBPyConnection, unit: T.Unit) -> tuple[pd.DataF
     mu = model.predict(df)
     X = df[list(unit.features)]
     sv = shap.TreeExplainer(model.model.booster_).shap_values(X)
-    reasons = drivers(X, sv)
+    reasons = drivers(readable(X), sv)
 
     out = pd.DataFrame({
         "unit_type": unit.name.rstrip("s"),

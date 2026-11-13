@@ -14,3 +14,4 @@ statsmodels>=0.14
 scikit-learn>=1.5
 lightgbm>=4.7
 shap>=0.46
+mapbox-vector-tile>=2.1
