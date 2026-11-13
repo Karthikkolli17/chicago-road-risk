@@ -96,6 +96,11 @@ def clip_to_city(pois: gpd.GeoDataFrame, areas: gpd.GeoDataFrame, buffer_ft: flo
     return pois[pois.intersects(city)].reset_index(drop=True)
 
 
+def search_area(areas: gpd.GeoDataFrame, buffer_ft: float = POI_BUFFER_FT):
+    # the city plus the band kept by clip_to_city, so a download covers every POI that is kept
+    return gpd.GeoSeries([areas.union_all().buffer(buffer_ft)], crs=areas.crs).to_crs("EPSG:4326").iloc[0]
+
+
 def fetch_pois(source: str = "pbf") -> gpd.GeoDataFrame:
 
     if source == "pbf":
@@ -107,8 +112,8 @@ def fetch_pois(source: str = "pbf") -> gpd.GeoDataFrame:
         for t in POI_TAGS.values():
             for k, v in t.items():
                 tags.setdefault(k, []).extend(v)
-        raw = overpass_retry(lambda: ox.features_from_place(config.OSM_PLACE, tags=tags),
-                             attempts_per_server=15)
+        area = search_area(gpd.read_parquet(COMMUNITY_AREAS_PATH))
+        raw = overpass_retry(lambda: ox.features_from_polygon(area, tags=tags), attempts_per_server=15)
     areas = gpd.read_parquet(COMMUNITY_AREAS_PATH)
     pois = clip_to_city(tidy_pois(raw), areas)
     pois.to_parquet(POIS_PATH, index=False)

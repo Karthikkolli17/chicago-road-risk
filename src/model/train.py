@@ -25,6 +25,8 @@ LGB_PARAMS = dict(objective="poisson", learning_rate=0.03, num_leaves=15, min_ch
                   subsample=0.8, subsample_freq=1, colsample_bytree=0.8, reg_lambda=1.0,
                   n_estimators=3000, random_state=SEED, verbose=-1)
 CAPTURE_AT = (0.01, 0.05, 0.10)
+# a weekly run stops if a model falls well below its Day 3-4 level (D2 0.25 / 0.41, top 5% 0.21 / 0.36)
+GATES = {"segments": {"d2": 0.20, "top5": 0.17}, "junctions": {"d2": 0.33, "top5": 0.30}}
 MIN_WINDOW_KM = 0.1  # ranking: road pieces shorter than this count as this long
 
 
@@ -75,7 +77,7 @@ def load(con: duckdb.DuckDBPyConnection, unit: Unit, years=YEARS) -> pd.DataFram
         WHERE {unit.where} ORDER BY t.{unit.id}""").df()
     if unit.extra_table:
         missing = con.execute(f"""SELECT count(*) FROM {unit.table} t
-                                  ANTI JOIN {unit.extra_table} x ON x.{unit.id} = t.{unit.id}""").fetchone()[0]
+                                  ANTI JOIN {unit.extra_table} x ON x.{unit.id} = t.{unit.id}""").fetchall()[0][0]
         if missing:  # a stale extra table must stop the run, not drop places from the map
             raise RuntimeError(f"{unit.extra_table} has no row for {missing} of the units in {unit.table}; "
                                "rebuild it")
@@ -167,6 +169,13 @@ def capture(y: np.ndarray, mu: np.ndarray, exposure: np.ndarray, share: float) -
     return float(y[top].sum() / y.sum())
 
 
+def level_factor(latest_year_ksi: float, per_year: np.ndarray) -> float:
+    # Yearly predictions are an average over the window; serious crashes fell 28% from 2021 to
+    # 2025, so that average runs high. Scale to the latest year's city total. One factor per unit
+    # type moves every place by the same share, so the ranking does not change.
+    return float(latest_year_ksi / np.sum(per_year))
+
+
 def evaluate(df: pd.DataFrame, preds: dict[str, np.ndarray], null: np.ndarray) -> pd.DataFrame:
     y, e = df["y"].to_numpy(), df["exposure"].to_numpy()
     d_null = poisson_deviance(y, null)
@@ -207,26 +216,52 @@ def cross_validate(df: pd.DataFrame, unit: Unit) -> tuple[pd.DataFrame, dict[str
     return metrics, oof, trees
 
 
-def temporal(con: duckdb.DuckDBPyConnection, unit: Unit) -> pd.DataFrame:
+def temporal(con: duckdb.DuckDBPyConnection, unit: Unit, years=YEARS) -> pd.DataFrame:
 
-    train, test = load(con, unit, (2021, 2024)), load(con, unit, (2025, 2025))
+    first, last = years
+    train, test = load(con, unit, (first, last - 1)), load(con, unit, (last, last))
+    recent = load(con, unit, (last - 1, last - 1))
     assert (train["id"].to_numpy() == test["id"].to_numpy()).all()
-    scale = 1 / 4  # four training years -> one test year
+    scale = 1 / (last - first)  # training years -> one test year
     null = train["y"].sum() / train["exposure"].sum() * test["exposure"].to_numpy()
+    lgbm = LGBM(unit).fit(train).predict(test) * scale
     preds = {"null (one city-wide rate)": null * scale,
-             "history (own 2021-24 KSI)": (train["y"].to_numpy() + 1e-3 * null) * scale,
+             f"history (own {first}-{last - 1 - 2000:02d} KSI)": (train["y"].to_numpy() + 1e-3 * null) * scale,
              "Poisson GLM": GLM(unit).fit(train).predict(test) * scale,
-             "LightGBM Poisson": LGBM(unit).fit(train).predict(test) * scale}
+             "LightGBM Poisson": lgbm,
+             f"LightGBM, scaled to {last - 1} level": lgbm * level_factor(recent["y"].sum(), lgbm)}
     return evaluate(test, preds, null * scale)
 
 
-def run() -> None:
+def gate(results: dict[str, tuple[pd.DataFrame, pd.DataFrame]]) -> list[str]:
+
+    fails = []
+    for name, (metrics, tmp) in results.items():
+        m = metrics.set_index("model")
+        lgbm, glm = m.loc["LightGBM Poisson"], m.loc["Poisson GLM"]
+        floor = GATES[name]
+        if lgbm["D2 vs null"] < floor["d2"]:
+            fails.append(f"{name}: D2 {lgbm['D2 vs null']:.3f} below {floor['d2']}")
+        if lgbm["KSI in top 5%"] < floor["top5"]:
+            fails.append(f"{name}: top-5% capture {lgbm['KSI in top 5%']:.3f} below {floor['top5']}")
+        if lgbm["KSI in top 5%"] < glm["KSI in top 5%"] - 0.02:
+            fails.append(f"{name}: LightGBM top-5% capture {lgbm['KSI in top 5%']:.3f} trails the GLM's "
+                         f"{glm['KSI in top 5%']:.3f}")
+        t = tmp.set_index("model")
+        if t.loc["LightGBM Poisson", "KSI in top 5%"] < t.loc["null (one city-wide rate)", "KSI in top 5%"] + 0.05:
+            fails.append(f"{name}: next-year top-5% capture barely beats a city-wide rate")
+    return fails
+
+
+def run() -> dict[str, tuple[pd.DataFrame, pd.DataFrame]]:
     
     con = duckdb.connect(str(config.WAREHOUSE), read_only=True)
     text = [f"# KSI models ({YEARS[0]}–{YEARS[1]})\n",
             f"Out-of-fold scores: {N_FOLDS}-fold GroupKFold by community area. "
             "'KSI in top x%' = share of actual serious crashes on the units the model ranks riskiest, "
             "covering x% of road km (segments) or x% of intersections.\n"]
+    period = f"train {YEARS[0]}–{YEARS[1] - 1}, test {YEARS[1]}"
+    results = {}
     for unit in UNITS:
         df = load(con, unit)
         metrics, oof, trees = cross_validate(df, unit)
@@ -236,15 +271,21 @@ def run() -> None:
                  metrics.to_string(index=False))
         cal = calibration(df, oof["lgbm"])
         tmp = temporal(con, unit)
-        log.info("%s temporal (train 2021-24, test 2025)\n%s", unit.name, tmp.to_string(index=False))
+        results[unit.name] = (metrics, tmp)
+        log.info("%s temporal (%s)\n%s", unit.name, period, tmp.to_string(index=False))
         text += [f"\n## {unit.name}: {len(df):,} units, {int(df['y'].sum()):,} KSI\n",
                  f"LightGBM trees per fold: {trees}. Poisson GLM dispersion (Pearson χ²/df): {disp:.2f}.\n",
                  "### Spatial cross-validation\n\n" + metrics.to_markdown(index=False),
                  "\n### LightGBM calibration by predicted-risk decile (out of fold)\n\n" + cal.to_markdown(index=False),
-                 "\n### Temporal check: train 2021–2024, test 2025\n\n" + tmp.to_markdown(index=False)]
+                 f"\n### Temporal check: {period}\n\n" + tmp.to_markdown(index=False)]
+    fails = gate(results)
+    text.insert(1, "## Quality gate\n\n" + ("All passed.\n" if not fails else "\n".join(f"- FAIL {f}" for f in fails) + "\n"))
     config.REPORTS.mkdir(exist_ok=True)
     (config.REPORTS / "model_eval.md").write_text("\n".join(text) + "\n")
     con.close()
+    if fails:
+        raise RuntimeError("model quality gate failed: " + "; ".join(fails))
+    return results
 
 
 if __name__ == "__main__":

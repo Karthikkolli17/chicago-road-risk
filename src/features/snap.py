@@ -246,6 +246,22 @@ def summarise(con) -> dict[str, pd.DataFrame]:
     return {"overall": overall, "by_type": by_type, "by_year": by_year, "method": method}
 
 
+MIN_MATCHED_PCT = 96.0  # 98.0% today
+MAX_KSI_UNMATCHED_PCT = 4.0  # 2.1% today
+
+
+def gate(results: dict[str, pd.DataFrame]) -> list[str]:
+
+    fails = []
+    pct = results["overall"]["pct_matched"].iloc[0]
+    if pct < MIN_MATCHED_PCT:
+        fails.append(f"only {pct}% of crashes matched to a road")
+    ksi = results["by_type"].set_index("crash_type")["pct_unmatched"].get("serious (KSI)", 100)
+    if ksi > MAX_KSI_UNMATCHED_PCT:
+        fails.append(f"{ksi}% of serious crashes unmatched")
+    return fails
+
+
 def write_report(results: dict[str, pd.DataFrame], path) -> None:
     text = [
         "# Snapping checks\n",
@@ -266,7 +282,7 @@ def write_report(results: dict[str, pd.DataFrame], path) -> None:
     path.write_text("\n".join(text) + "\n")
 
 
-def run() -> None:
+def run() -> dict[str, pd.DataFrame]:
     con = duckdb.connect(str(config.WAREHOUSE))
     crashes, segments = load_inputs(con)
     result = snap(crashes, segments)
@@ -277,6 +293,7 @@ def run() -> None:
         log.info("%s\n%s", name, df.to_string(index=False))
     write_report(results, config.REPORTS / "snap_checks.md")
     con.close()
+    return results
 
 
 if __name__ == "__main__":

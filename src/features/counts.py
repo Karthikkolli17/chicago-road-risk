@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import date
 
 import duckdb
 import geopandas as gpd
@@ -12,7 +13,16 @@ from src.ingest.osm import SEGMENTS_PATH
 
 log = logging.getLogger(__name__)
 
-YEARS = (2021, 2025)  # five full years; 2026 is left for the pipeline to add
+N_YEARS = 5
+
+
+def model_years(today: date | None = None, n: int = N_YEARS) -> tuple[int, int]:
+    # the last n full calendar years: in 2026 that is 2021-2025, from January 2027 2022-2026
+    last = (today or date.today()).year - 1
+    return last - n + 1, last
+
+
+YEARS = model_years()
 
 
 def build_counts(con: duckdb.DuckDBPyConnection, network: pd.DataFrame, years=YEARS) -> pd.DataFrame:

@@ -101,6 +101,8 @@ def predict_unit(con: duckdb.DuckDBPyConnection, unit: T.Unit) -> tuple[pd.DataF
     model = T.LGBM(unit).fit(df)
     mu = model.predict(df)
     X = df[list(unit.features)]
+    latest = T.load(con, unit, (YEARS[1], YEARS[1]))["y"].sum()
+    factor = T.level_factor(latest, mu / N_YEARS)
     sv = shap.TreeExplainer(model.model.booster_).shap_values(X)
     reasons = drivers(readable(X), sv)
 
@@ -112,8 +114,10 @@ def predict_unit(con: duckdb.DuckDBPyConnection, unit: T.Unit) -> tuple[pd.DataF
         "actual_ksi": df["y"],
         "expected_ksi": mu,
         "expected_ksi_per_year": mu / N_YEARS,
+        "expected_ksi_next_year": mu / N_YEARS * factor,
+        "level_factor": factor,
         "oof_expected_ksi": oof["lgbm"],
-        "risk": T.risk_score(mu / N_YEARS, df["exposure"].to_numpy()),
+        "risk": T.risk_score(mu / N_YEARS * factor, df["exposure"].to_numpy()),
     })
     out["rank"] = out["risk"].rank(ascending=False, method="first").astype(int)
     out["percentile"] = (100 * out["risk"].rank(pct=True)).round(2)
@@ -137,20 +141,66 @@ def checks(pred: pd.DataFrame) -> list[str]:
             fails.append(f"{u}: ranks are not 1..n")
         if d[["expected_ksi", "risk", "oof_expected_ksi"]].isna().any().any() or (d["expected_ksi"] <= 0).any():
             fails.append(f"{u}: missing or non-positive predictions")
+        f = d["level_factor"].iloc[0]
+        if not 0.5 < f < 1.5 or d["level_factor"].nunique() != 1:
+            fails.append(f"{u}: level factor {f:.3f} outside 0.5..1.5")
         top = d[d["percentile"] >= 99]  # the riskiest 1% must each come with at least one reason
         if top["driver_1"].isna().any():
             fails.append(f"{u}: {top['driver_1'].isna().sum()} of the riskiest 1% have no reason")
     return fails
 
 
+def publish(con: duckdb.DuckDBPyConnection, pred: pd.DataFrame, fails: list[str]) -> None:
+
+    # The app reads `predictions`. A run that fails its checks never replaces it: its output goes
+    # to `predictions_rejected` for a look. A good run keeps the one it replaces as `predictions_previous`.
+    con = con.cursor()  # own result state: an unread result elsewhere on the connection cannot block this
+    con.register("_p", pred)
+    try:
+        if fails:
+            con.execute("CREATE OR REPLACE TABLE predictions_rejected AS SELECT * FROM _p ORDER BY unit_type, rank")
+            return
+        con.execute("BEGIN TRANSACTION")
+        if con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'predictions'").fetchall()[0][0]:
+            con.execute("CREATE OR REPLACE TABLE predictions_previous AS SELECT * FROM predictions")
+        con.execute("CREATE OR REPLACE TABLE predictions AS SELECT * FROM _p ORDER BY unit_type, rank")
+        con.execute("DROP TABLE IF EXISTS predictions_rejected")
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")  # else cleanup fails on the aborted transaction and hides this error
+        raise
+    finally:
+        con.unregister("_p")
+
+
+def churn(con: duckdb.DuckDBPyConnection, share: float = 0.01) -> pd.DataFrame:
+
+    if not con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'predictions_previous'").fetchall()[0][0]:
+        return pd.DataFrame()
+    return con.execute(f"""
+        WITH n AS (SELECT unit_type, count(*) AS n FROM predictions GROUP BY 1),
+        new AS (SELECT p.unit_type, p.unit_id FROM predictions p JOIN n USING (unit_type)
+                WHERE p.rank <= ceil(n.n * {share})),
+        old AS (SELECT p.unit_type, p.unit_id FROM predictions_previous p JOIN n USING (unit_type)
+                WHERE p.rank <= ceil(n.n * {share}))
+        SELECT unit_type, count(*) FILTER (o.unit_id IS NOT NULL) AS stayed,
+               count(*) FILTER (o.unit_id IS NULL) AS entered
+        FROM new LEFT JOIN old o USING (unit_type, unit_id) GROUP BY 1 ORDER BY 1""").df()
+
+
 def run() -> None:
     con = duckdb.connect(str(config.WAREHOUSE))
     preds, imps = zip(*(predict_unit(con, u) for u in T.UNITS))
     pred, imp = pd.concat(preds, ignore_index=True), pd.concat(imps, ignore_index=True)
-    con.register("_p", pred)
-    con.execute("CREATE OR REPLACE TABLE predictions AS SELECT * FROM _p ORDER BY unit_type, rank")
-    con.unregister("_p")
     fails = checks(pred)
+    publish(con, pred, fails)
+    if fails:
+        con.close()
+        raise RuntimeError("prediction checks failed, previous predictions kept: " + "; ".join(fails))
+    moved = churn(con)
+    levels = pred.groupby("unit_type").agg(
+        level_factor=("level_factor", "first"), window_average_per_year=("expected_ksi_per_year", "sum"),
+        next_year=("expected_ksi_next_year", "sum")).round(3).reset_index()
 
     names = con.execute("""
         SELECT p.unit_type, p.rank, coalesce(s.name, j.streets) AS place, p.actual_ksi,
@@ -165,19 +215,23 @@ def run() -> None:
         WHERE p.rank <= 15 ORDER BY p.unit_type, p.rank""").df()
     con.close()
     text = ["# Predictions and drivers\n",
-            "Risk = expected KSI per year (2021–2025 average level) per km of mid-block road (pieces "
+            f"Risk = expected KSI per year ({YEARS[1]} level: the {YEARS[0]}–{YEARS[1]} average scaled to "
+            f"the {YEARS[1]} city total) per km of mid-block road (pieces "
             f"under {T.MIN_WINDOW_KM * 1000:.0f} m count as {T.MIN_WINDOW_KM * 1000:.0f} m), or per intersection. "
             f"Drivers are the features that raise a unit's risk most (SHAP, at least +{MIN_SHAP} on the "
             "log-rate scale); absences, data-quality flags, length and hospital distance are never shown "
             "as reasons.\n",
-            "## Checks\n\n" + ("All passed." if not fails else "\n".join(f"- FAIL {f}" for f in fails)),
+            "## Checks\n\nAll passed.",
+            f"\n## Level\n\nYearly numbers are scaled to the {YEARS[1]} city total of serious crashes:\n\n"
+            + levels.to_markdown(index=False),
+            "\n## Change since the previous run\n\n"
+            + ("First run: nothing to compare." if moved.empty else
+               "Places in the riskiest 1% now, and whether they were there last run:\n\n" + moved.to_markdown(index=False)),
             "\n## What drives risk overall (mean |SHAP|, log-rate scale)\n\n" + imp.to_markdown(index=False),
             "\n## Highest-risk units\n\n" + names.to_markdown(index=False)]
     (config.REPORTS / "predictions.md").write_text("\n".join(text) + "\n")
     log.info("importance\n%s", imp.to_string(index=False))
     log.info("top\n%s", names.to_string(index=False))
-    if fails:
-        raise RuntimeError("prediction checks failed: " + "; ".join(fails))
 
 
 if __name__ == "__main__":

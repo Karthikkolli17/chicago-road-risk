@@ -86,9 +86,9 @@ def tile_path(kind: str, x: int, y: int):
     return TILE_DIR / kind / f"{ZOOM}_{x}_{y}.mvt"
 
 
-def download(client: TileClient, tiles: list[tuple[int, int]], kinds=tuple(LAYERS)) -> int:
+def download(client: TileClient, tiles: list[tuple[int, int]], kinds=tuple(LAYERS), force: bool = False) -> int:
 
-    todo = [(k, x, y) for k in kinds for x, y in tiles if not tile_path(k, x, y).exists()]
+    todo = [(k, x, y) for k in kinds for x, y in tiles if force or not tile_path(k, x, y).exists()]
     log.info("mapillary: %d tiles to fetch (%d cached)", len(todo), len(kinds) * len(tiles) - len(todo))
 
     def fetch(job):
@@ -175,10 +175,10 @@ def checks(det: pd.DataFrame, img: pd.DataFrame, n_tiles: int) -> list[str]:
     return fails
 
 
-def run() -> None:
+def run(force: bool = False) -> None:
     tiles = city_tiles()
     log.info("mapillary: %d tiles at zoom %d cover the city", len(tiles), ZOOM)
-    download(TileClient(token()), tiles)
+    download(TileClient(token()), tiles, force=force)
     det, img = build(tiles)
     MLY_DIR.mkdir(parents=True, exist_ok=True)
     det.to_parquet(DETECTIONS_PATH, index=False)

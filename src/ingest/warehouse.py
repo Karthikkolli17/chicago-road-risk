@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import duckdb
@@ -94,6 +94,26 @@ def checks(con: duckdb.DuckDBPyConnection) -> dict[str, pd.DataFrame]:
     return {"by_year": by_year, "coords": coords, "orphans": orphans}
 
 
+MAX_BAD_COORDS_PCT = 2.0  # about 1% today
+MIN_YEAR_SHARE = 0.8  # a full year with under 80% of the median year's crashes means missing months
+
+
+def gate(results: dict[str, pd.DataFrame], today: date | None = None) -> list[str]:
+
+    fails = []
+    y = results["by_year"]
+    full = y[y["crash_year"] < (today or date.today()).year]
+    low = full[full["crashes"] < MIN_YEAR_SHARE * full["crashes"].median()]
+    if len(low):
+        fails.append(f"years with too few crashes: {low['crash_year'].tolist()}")
+    bad = 100 - results["coords"].set_index("coord_status")["pct"].get("ok", 0)
+    if bad > MAX_BAD_COORDS_PCT:
+        fails.append(f"{bad:.2f}% of crashes have no usable location")
+    if results["orphans"]["vru_people_without_crash"].iloc[0]:
+        fails.append(f"{results['orphans']['vru_people_without_crash'].iloc[0]} people rows without a crash")
+    return fails
+
+
 def write_report(results: dict[str, pd.DataFrame], extra: dict[str, object], path: Path) -> None:
     lines = [f"# Ingest checks\n\nGenerated {datetime.now():%Y-%m-%d %H:%M}.\n"]
     for k, v in extra.items():
@@ -106,7 +126,7 @@ def write_report(results: dict[str, pd.DataFrame], extra: dict[str, object], pat
     path.write_text("\n".join(lines) + "\n")
 
 
-def run() -> None:
+def run() -> dict[str, pd.DataFrame]:
     from src.ingest.osm import SEGMENTS_PATH
 
     con = duckdb.connect(str(config.WAREHOUSE))
@@ -122,6 +142,7 @@ def run() -> None:
         log.info("%s\n%s", name, df.to_string(index=False))
     write_report(results, {"Road segments (motorways excluded)": n_seg}, config.REPORTS / "ingest_checks.md")
     con.close()
+    return results
 
 
 if __name__ == "__main__":
